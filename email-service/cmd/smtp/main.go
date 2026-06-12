@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -14,8 +15,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
-
 	"time"
 
 	"github.com/emersion/go-smtp"
@@ -63,19 +64,24 @@ func main() {
 	// ── Dependencies ──────────────────────────────────────────────────────────
 	clientRepo := repository.NewClientRepository(db)
 	emailLogRepo := repository.NewEmailLogRepository(db)
+	blacklistRepo := repository.NewBlacklistRepository(db)
 	emailQueue := queue.NewQueue(rdb)
 	authenticator := auth.New(clientRepo, rdb, cfg.Security.BcryptCost)
 	limiter := ratelimit.NewRateLimiter(rdb)
 
-	// ── SMTP server ───────────────────────────────────────────────────────────
+	// ── SMTP backend ──────────────────────────────────────────────────────────
 	be := &smtpBackend{
 		cfg:           cfg.SMTP,
+		logger:        logger,
 		authenticator: authenticator,
 		emailLogs:     emailLogRepo,
+		blacklist:     blacklistRepo,
 		emailQueue:    emailQueue,
 		limiter:       limiter,
+		maxConns:      int64(cfg.SMTP.MaxConnections),
 	}
 
+	// ── Server ────────────────────────────────────────────────────────────────
 	s := smtp.NewServer(be)
 	s.Addr = ":" + cfg.SMTP.Port
 	s.Domain = cfg.SMTP.Domain
@@ -85,8 +91,27 @@ func main() {
 	s.MaxRecipients = cfg.SMTP.MaxRecipients
 	s.AllowInsecureAuth = cfg.SMTP.AllowInsecureAuth
 
+	// STARTTLS — enabled when cert and key are provided.
+	if cfg.SMTP.TLSCertFile != "" && cfg.SMTP.TLSKeyFile != "" {
+		tlsCert, err := tls.LoadX509KeyPair(cfg.SMTP.TLSCertFile, cfg.SMTP.TLSKeyFile)
+		if err != nil {
+			logger.Error("load TLS certificate failed", "error", err)
+			os.Exit(1)
+		}
+		s.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		s.AllowInsecureAuth = false // require STARTTLS before AUTH when TLS is configured
+		logger.Info("STARTTLS enabled", "cert", cfg.SMTP.TLSCertFile)
+	}
+
 	go func() {
-		logger.Info("SMTP server starting", "port", cfg.SMTP.Port, "domain", cfg.SMTP.Domain)
+		logger.Info("SMTP server starting",
+			"port", cfg.SMTP.Port,
+			"domain", cfg.SMTP.Domain,
+			"tls", s.TLSConfig != nil,
+		)
 		if err := s.ListenAndServe(); err != nil {
 			logger.Error("SMTP server error", "error", err)
 			os.Exit(1)
@@ -107,13 +132,26 @@ func main() {
 
 type smtpBackend struct {
 	cfg           config.SMTPConfig
+	logger        *slog.Logger
 	authenticator *auth.Authenticator
 	emailLogs     *repository.EmailLogRepository
+	blacklist     *repository.BlacklistRepository
 	emailQueue    *queue.Queue
 	limiter       *ratelimit.RateLimiter
+
+	maxConns  int64 // configured limit
+	connCount int64 // current active connections (atomic)
 }
 
-func (b *smtpBackend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
+func (b *smtpBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	if b.maxConns > 0 {
+		cur := atomic.AddInt64(&b.connCount, 1)
+		if cur > b.maxConns {
+			atomic.AddInt64(&b.connCount, -1)
+			return nil, &smtp.SMTPError{Code: 421, EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+				Message: "too many connections, try later"}
+		}
+	}
 	return &smtpSession{backend: b}, nil
 }
 
@@ -126,52 +164,88 @@ type smtpSession struct {
 	to      []string
 }
 
-// AuthPlain is called by go-smtp for both AUTH PLAIN and AUTH LOGIN.
+// AuthPlain is called by go-smtp for AUTH PLAIN and AUTH LOGIN.
 func (s *smtpSession) AuthPlain(username, password string) error {
 	client, err := s.backend.authenticator.ValidateSmtpCredentials(
 		context.Background(), username, password)
 	if err != nil {
-		return fmt.Errorf("authentication failed: %w", err)
+		return &smtp.SMTPError{Code: 535, EnhancedCode: smtp.EnhancedCode{5, 7, 8},
+			Message: "authentication failed"}
 	}
 	s.client = client
 	return nil
 }
 
+// Mail stores the envelope sender and verifies it is not blacklisted.
 func (s *smtpSession) Mail(from string, _ *smtp.MailOptions) error {
 	if s.client == nil {
-		return fmt.Errorf("authentication required")
+		return &smtp.SMTPError{Code: 530, EnhancedCode: smtp.EnhancedCode{5, 7, 0},
+			Message: "authentication required"}
+	}
+	bl, err := s.backend.blacklist.IsBlacklisted(context.Background(), s.client.ID, from)
+	if err == nil && bl {
+		return &smtp.SMTPError{Code: 553, EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+			Message: "sender address rejected"}
 	}
 	s.from = from
 	return nil
 }
 
+// Rcpt appends a recipient, checking blacklist and per-message recipient cap.
 func (s *smtpSession) Rcpt(to string, _ *smtp.RcptOptions) error {
 	if s.client == nil {
-		return fmt.Errorf("authentication required")
+		return &smtp.SMTPError{Code: 530, EnhancedCode: smtp.EnhancedCode{5, 7, 0},
+			Message: "authentication required"}
+	}
+	if len(s.to) >= s.backend.cfg.MaxRecipients {
+		return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 5, 3},
+			Message: fmt.Sprintf("max %d recipients per message", s.backend.cfg.MaxRecipients)}
+	}
+	bl, err := s.backend.blacklist.IsBlacklisted(context.Background(), s.client.ID, to)
+	if err == nil && bl {
+		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1},
+			Message: "recipient address blacklisted"}
 	}
 	s.to = append(s.to, to)
 	return nil
 }
 
+// Data reads the message body, enforces rate limits (returning 451 for hourly
+// and 452 for monthly quota), records an email_log entry, and enqueues the job.
 func (s *smtpSession) Data(r io.Reader) error {
 	if s.client == nil {
-		return fmt.Errorf("authentication required")
+		return &smtp.SMTPError{Code: 530, EnhancedCode: smtp.EnhancedCode{5, 7, 0},
+			Message: "authentication required"}
 	}
 	ctx := context.Background()
 
-	// Atomic check of both hourly (sliding window) and monthly limits.
-	rl, err := s.backend.limiter.CheckAll(ctx, s.client.ID,
-		s.client.HourlyLimit, s.client.MonthlyLimit)
+	// Atomic dual-limit check. Distinguish hourly (4xx transient) from monthly
+	// (452 storage-exceeded) based on when the window resets.
+	rl, err := s.backend.limiter.CheckAll(ctx,
+		s.client.ID, s.client.HourlyLimit, s.client.MonthlyLimit)
 	if err != nil {
-		return fmt.Errorf("rate limit check failed")
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+			Message: "internal error checking rate limits"}
 	}
 	if !rl.Allowed {
-		return fmt.Errorf("rate limit exceeded, retry after %s", rl.ResetAt.Format(time.RFC1123))
+		if rl.ResetAt.Sub(time.Now()) > 2*time.Hour {
+			// Reset is far away → monthly quota exhausted.
+			return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
+				Message: "monthly email quota exceeded"}
+		}
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+			Message: fmt.Sprintf("hourly rate limit exceeded, retry after %s",
+				rl.ResetAt.UTC().Format(time.RFC1123))}
 	}
 
-	rawMsg, err := io.ReadAll(r)
+	rawMsg, err := io.ReadAll(io.LimitReader(r, s.backend.cfg.MaxMessageBytes+1))
 	if err != nil {
-		return fmt.Errorf("read message: %w", err)
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+			Message: "error reading message data"}
+	}
+	if int64(len(rawMsg)) > s.backend.cfg.MaxMessageBytes {
+		return &smtp.SMTPError{Code: 552, EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+			Message: "message size exceeds limit"}
 	}
 
 	subject, htmlBody, textBody := parseRawMessage(rawMsg)
@@ -191,7 +265,10 @@ func (s *smtpSession) Data(r io.Reader) error {
 		Status:    repository.StatusQueued,
 	}
 	if err := s.backend.emailLogs.Create(ctx, emailLog); err != nil {
-		return fmt.Errorf("create email log: %w", err)
+		s.backend.logger.Error("create email log failed",
+			"client_id", s.client.ID, "error", err)
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+			Message: "failed to record message"}
 	}
 
 	job := &queue.EmailJob{
@@ -204,8 +281,18 @@ func (s *smtpSession) Data(r io.Reader) error {
 		TextBody: textBody,
 	}
 	if err := s.backend.emailQueue.Push(ctx, job); err != nil {
-		return fmt.Errorf("enqueue job: %w", err)
+		s.backend.logger.Error("queue push failed",
+			"client_id", s.client.ID, "log_id", logID, "error", err)
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+			Message: "failed to queue message"}
 	}
+
+	s.backend.logger.Info("message accepted",
+		"log_id", logID,
+		"client_id", s.client.ID,
+		"from", s.from,
+		"recipients", len(s.to),
+	)
 	return nil
 }
 
@@ -214,7 +301,10 @@ func (s *smtpSession) Reset() {
 	s.to = nil
 }
 
-func (s *smtpSession) Logout() error { return nil }
+func (s *smtpSession) Logout() error {
+	atomic.AddInt64(&s.backend.connCount, -1)
+	return nil
+}
 
 // ── RFC 2822 parser ───────────────────────────────────────────────────────────
 
@@ -266,6 +356,7 @@ func readPart(r io.Reader) string {
 	return string(b)
 }
 
+// newLogger is kept here to avoid importing a shared package for a one-liner.
 func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	switch level {
@@ -280,3 +371,4 @@ func newLogger(level string) *slog.Logger {
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
 }
+

@@ -92,13 +92,16 @@ type ServerConfig struct {
 
 // SMTPConfig holds SMTP proxy server settings.
 type SMTPConfig struct {
-	Port              string        // SMTP_PORT
+	Port              string        // SMTP_PORT (default: 587)
 	Domain            string        // SMTP_DOMAIN
-	MaxMessageBytes   int64         // SMTP_MAX_MESSAGE_BYTES
-	MaxRecipients     int           // SMTP_MAX_RECIPIENTS
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	AllowInsecureAuth bool // SMTP_ALLOW_INSECURE_AUTH
+	TLSCertFile       string        // SMTP_TLS_CERT_FILE — PEM certificate for STARTTLS
+	TLSKeyFile        string        // SMTP_TLS_KEY_FILE  — PEM private key for STARTTLS
+	MaxMessageBytes   int64         // SMTP_MAX_MESSAGE_BYTES (default: 25 MiB)
+	MaxRecipients     int           // SMTP_MAX_RECIPIENTS (default: 50)
+	MaxConnections    int           // SMTP_MAX_CONNECTIONS (default: 1000)
+	ReadTimeout       time.Duration // SMTP_READ_TIMEOUT (default: 60s)
+	WriteTimeout      time.Duration // SMTP_WRITE_TIMEOUT (default: 30s)
+	AllowInsecureAuth bool          // SMTP_ALLOW_INSECURE_AUTH — set true in dev when no TLS
 }
 
 // TrackingConfig holds email open/click tracking settings.
@@ -188,13 +191,16 @@ func (c *Config) populate() {
 	c.APIServer.IdleTimeout = getEnvDuration("API_IDLE_TIMEOUT", 60*time.Second)
 
 	// SMTP Server
-	c.SMTP.Port = getEnv("SMTP_PORT", "2525")
+	c.SMTP.Port = getEnv("SMTP_PORT", "587")
 	c.SMTP.Domain = getEnv("SMTP_DOMAIN", "localhost")
-	c.SMTP.MaxMessageBytes = int64(getEnvInt("SMTP_MAX_MESSAGE_BYTES", 10*1024*1024))
+	c.SMTP.TLSCertFile = os.Getenv("SMTP_TLS_CERT_FILE")
+	c.SMTP.TLSKeyFile = os.Getenv("SMTP_TLS_KEY_FILE")
+	c.SMTP.MaxMessageBytes = int64(getEnvInt("SMTP_MAX_MESSAGE_BYTES", 25*1024*1024))
 	c.SMTP.MaxRecipients = getEnvInt("SMTP_MAX_RECIPIENTS", 50)
-	c.SMTP.ReadTimeout = 30 * time.Second
-	c.SMTP.WriteTimeout = 30 * time.Second
-	c.SMTP.AllowInsecureAuth = getEnvBool("SMTP_ALLOW_INSECURE_AUTH", true)
+	c.SMTP.MaxConnections = getEnvInt("SMTP_MAX_CONNECTIONS", 1000)
+	c.SMTP.ReadTimeout = getEnvDuration("SMTP_READ_TIMEOUT", 60*time.Second)
+	c.SMTP.WriteTimeout = getEnvDuration("SMTP_WRITE_TIMEOUT", 30*time.Second)
+	c.SMTP.AllowInsecureAuth = getEnvBool("SMTP_ALLOW_INSECURE_AUTH", c.SMTP.TLSCertFile == "")
 
 	// Tracking
 	c.Tracking.BaseURL = strings.TrimRight(os.Getenv("TRACKING_BASE_URL"), "/")
