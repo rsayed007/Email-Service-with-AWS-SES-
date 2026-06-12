@@ -96,7 +96,7 @@ func (r *EmailLogRepository) UpdateStatus(ctx context.Context, id, status string
 			`UPDATE email_logs SET status = ?, clicked_at = COALESCE(clicked_at, ?) WHERE id = ?`,
 			status, now, id)
 
-	case StatusBounced:
+	case StatusBounced, StatusHardBounced, StatusSoftBounced:
 		_, err = r.db.ExecContext(ctx,
 			`UPDATE email_logs SET status = ?, bounced_at = ? WHERE id = ?`,
 			status, now, id)

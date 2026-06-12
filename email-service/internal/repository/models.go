@@ -83,12 +83,14 @@ type BlacklistedEmail struct {
 
 // Email status constants used across the repository and service layers.
 const (
-	StatusQueued    = "queued"
-	StatusSent      = "sent"
-	StatusDelivered = "delivered"
-	StatusOpened    = "opened"
-	StatusClicked   = "clicked"
-	StatusBounced   = "bounced"
+	StatusQueued     = "queued"
+	StatusSent       = "sent"
+	StatusDelivered  = "delivered"
+	StatusOpened     = "opened"
+	StatusClicked    = "clicked"
+	StatusBounced    = "bounced"      // kept for legacy reads; new writes use the typed variants
+	StatusHardBounced = "hard_bounced" // permanent bounce — recipient address blacklisted
+	StatusSoftBounced = "soft_bounced" // transient bounce — may succeed on retry
 	StatusComplained = "complained"
-	StatusFailed    = "failed"
+	StatusFailed     = "failed"
 )

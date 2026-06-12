@@ -72,7 +72,7 @@ func main() {
 	limiter := ratelimit.NewRateLimiter(rdb)
 	emailQueue := queue.NewQueue(rdb)
 	trackHandlers := tracking.NewHandlers(emailLogRepo, statsRepo, logger)
-	snsHandler := webhook.NewSNSHandler(emailLogRepo, statsRepo, blacklistRepo)
+	snsHandler := webhook.NewSNSHandler(emailLogRepo, statsRepo, blacklistRepo, logger)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	if cfg.App.IsProd() {
@@ -87,8 +87,9 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// SNS events — AWS signs its own payloads; no auth middleware here.
-	r.POST("/webhooks/sns", snsHandler.Handle)
+	// SES event notifications from AWS SNS.
+	// SNSVerifyMiddleware validates the RSA signature before the payload is processed.
+	r.POST("/webhooks/ses", webhook.SNSVerifyMiddleware(), snsHandler.Handle)
 
 	// Open-tracking pixel: GET /o/:logID
 	r.GET("/o/:logID", trackHandlers.HandleOpen)
