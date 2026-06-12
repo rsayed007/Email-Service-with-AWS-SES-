@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -11,14 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/redis/go-redis/v9"
 
 	"email-service/internal/config"
 	"email-service/internal/delivery"
 	"email-service/internal/queue"
 	"email-service/internal/repository"
+	"email-service/internal/tracking"
 	"email-service/pkg/database"
 )
 
@@ -61,141 +62,183 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Dependencies ──────────────────────────────────────────────────────────
-	emailLogRepo := repository.NewEmailLogRepository(db)
-	statsRepo := repository.NewStatsRepository(db)
-	blacklistRepo := repository.NewBlacklistRepository(db)
-	sesClient := delivery.NewSESClient(awsCfg, cfg.AWS.SESConfigurationSet)
-	emailQueue := queue.NewQueue(rdb)
+	// ── Worker ────────────────────────────────────────────────────────────────
+	w := &Worker{
+		queue: queue.NewQueue(rdb),
+		ses:   delivery.NewSESDelivery(awsCfg, cfg.AWS.SNSTopicARN),
+		tracker: tracking.NewTracker(
+			cfg.Tracking.HMACSecret,
+			cfg.Tracking.BaseURL,
+			cfg.Tracking.PixelPath,
+			cfg.Tracking.ClickPath,
+		),
+		logs:      repository.NewEmailLogRepository(db),
+		stats:     repository.NewStatsRepository(db),
+		blacklist: repository.NewBlacklistRepository(db),
+		logger:    logger,
+	}
 
-	// ── Worker pool ───────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.Worker.Concurrency; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			runWorker(ctx, id, logger, cfg.Queue,
-				emailQueue, sesClient, emailLogRepo, statsRepo, blacklistRepo)
-		}(i)
-	}
+	w.Start(ctx, cfg.Worker.Concurrency)
 	logger.Info("worker pool started", "concurrency", cfg.Worker.Concurrency)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+
 	logger.Info("worker pool shutting down")
 	cancel()
-	wg.Wait()
+	w.Wait()
 	logger.Info("worker pool stopped")
 }
 
-func runWorker(
-	ctx context.Context,
-	id int,
-	logger *slog.Logger,
-	qcfg config.QueueConfig,
-	q *queue.Queue,
-	ses *delivery.SESClient,
-	logs *repository.EmailLogRepository,
-	stats *repository.StatsRepository,
-	blacklist *repository.BlacklistRepository,
-) {
-	logger.Debug("worker started", "worker_id", id)
+// ── Worker ────────────────────────────────────────────────────────────────────
+
+// Worker manages a pool of goroutines that dequeue and deliver email jobs.
+type Worker struct {
+	queue     *queue.Queue
+	ses       *delivery.SESDelivery
+	tracker   *tracking.Tracker
+	logs      *repository.EmailLogRepository
+	stats     *repository.StatsRepository
+	blacklist *repository.BlacklistRepository
+	logger    *slog.Logger
+	wg        sync.WaitGroup
+}
+
+// Start launches concurrency goroutines and returns immediately.
+// Call Wait to block until all goroutines exit after ctx is cancelled.
+func (w *Worker) Start(ctx context.Context, concurrency int) {
+	for i := 0; i < concurrency; i++ {
+		w.wg.Add(1)
+		go func(id int) {
+			defer w.wg.Done()
+			w.run(ctx, id)
+		}(i)
+	}
+}
+
+// Wait blocks until all worker goroutines have exited.
+func (w *Worker) Wait() {
+	w.wg.Wait()
+}
+
+func (w *Worker) run(ctx context.Context, id int) {
+	w.logger.Debug("worker started", "worker_id", id)
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Debug("worker stopped", "worker_id", id)
+			w.logger.Debug("worker stopped", "worker_id", id)
 			return
 		default:
 		}
 
-		job, err := q.Dequeue(ctx, 5*time.Second)
+		job, err := w.queue.Pop(ctx)
 		if err != nil {
-			logger.Error("dequeue error", "worker_id", id, "error", err)
+			if !errors.Is(err, context.Canceled) {
+				w.logger.Error("queue pop error", "worker_id", id, "error", err)
+			}
 			continue
 		}
 		if job == nil {
-			continue // timeout, no job available
+			continue // pop timeout — no job available
 		}
 
-		logger.Info("processing job", "worker_id", id, "job_id", job.ID, "attempt", job.Attempts+1)
+		w.logger.Info("processing job",
+			"worker_id", id,
+			"job_id", job.ID,
+			"client_id", job.ClientID,
+			"attempt", job.Attempts+1,
+		)
 
-		if err := processJob(ctx, job, ses, logs, stats, blacklist); err != nil {
-			logger.Error("job failed", "worker_id", id, "job_id", job.ID,
-				"attempt", job.Attempts+1, "error", err)
+		if err := w.processJob(ctx, job); err != nil {
+			w.logger.Error("job failed",
+				"worker_id", id,
+				"job_id", job.ID,
+				"attempt", job.Attempts+1,
+				"error", err,
+			)
 
-			if job.Attempts < qcfg.MaxRetries {
-				time.Sleep(qcfg.RetryDelay)
-				if reqErr := q.Requeue(ctx, job); reqErr != nil {
-					logger.Error("requeue error", "worker_id", id, "job_id", job.ID, "error", reqErr)
-				}
-			} else {
-				logger.Warn("job exhausted retries, marking failed",
+			// Permanent SES errors must not be retried.
+			var sesErr delivery.SESError
+			if errors.As(err, &sesErr) && !sesErr.IsRetryable() {
+				_ = w.logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
+				continue
+			}
+
+			// Re-queue or move to DLQ when retry limit is reached.
+			if retryErr := w.queue.Retry(ctx, job, err.Error()); retryErr != nil {
+				w.logger.Error("retry failed", "worker_id", id, "job_id", job.ID, "error", retryErr)
+			}
+			if job.Attempts >= queue.MaxRetries {
+				w.logger.Warn("job exhausted retries, marked failed",
 					"worker_id", id, "job_id", job.ID)
-				_ = logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
+				_ = w.logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
 			}
 			continue
 		}
 
-		logger.Info("job completed", "worker_id", id, "job_id", job.ID)
+		w.logger.Info("job completed", "worker_id", id, "job_id", job.ID)
 	}
 }
 
-func processJob(
-	ctx context.Context,
-	job *queue.EmailJob,
-	ses *delivery.SESClient,
-	logs *repository.EmailLogRepository,
-	stats *repository.StatsRepository,
-	blacklist *repository.BlacklistRepository,
-) error {
-	// Filter blacklisted recipients before calling SES.
+// processJob performs a single end-to-end email delivery:
+//  1. Filters blacklisted recipients.
+//  2. Injects open-pixel and click-tracking into the HTML body.
+//  3. Sends via AWS SES.
+//  4. Persists the SES message ID and updates the log status.
+//  5. Increments daily sent stats.
+func (w *Worker) processJob(ctx context.Context, job *queue.EmailJob) error {
+	// 1. Blacklist filter.
 	validTo := make([]string, 0, len(job.To))
 	for _, addr := range job.To {
-		bl, err := blacklist.IsBlacklisted(ctx, job.ClientID, addr)
+		bl, err := w.blacklist.IsBlacklisted(ctx, job.ClientID, addr)
 		if err != nil {
-			return fmt.Errorf("blacklist check for %s: %w", addr, err)
+			return fmt.Errorf("blacklist check %s: %w", addr, err)
 		}
 		if !bl {
 			validTo = append(validTo, addr)
 		}
 	}
-
 	if len(validTo) == 0 {
-		return logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
+		// All recipients are blacklisted — mark as failed without SES call.
+		_ = w.logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
+		return nil
 	}
 
-	req := delivery.SendRequest{
+	// 2. Tracking injection.
+	htmlBody := job.HTMLBody
+	if htmlBody != "" {
+		htmlBody = w.tracker.InjectTracking(htmlBody, job.ID, job.ClientID)
+	}
+
+	// 3. SES delivery.
+	result, err := w.ses.Send(ctx, &delivery.EmailJob{
+		ClientID: job.ClientID,
+		LogID:    job.ID,
 		From:     job.From,
 		To:       validTo,
+		ReplyTo:  job.ReplyTo,
 		Subject:  job.Subject,
-		HTMLBody: job.HTMLBody,
+		HTMLBody: htmlBody,
 		TextBody: job.TextBody,
-		Tags: map[string]string{
-			"client_id": job.ClientID,
-			"log_id":    job.ID,
-		},
-	}
-	if job.ReplyTo != "" {
-		req.ReplyTo = []string{job.ReplyTo}
-	}
-
-	result, err := ses.Send(ctx, req)
+	})
 	if err != nil {
 		return fmt.Errorf("ses.Send: %w", err)
 	}
 
-	if err := logs.SetAWSMessageID(ctx, job.ID, result.MessageID); err != nil {
-		// Non-fatal: continue so the status update still happens.
-		_ = err
+	// 4. Persist result.
+	if err := w.logs.SetAWSMessageID(ctx, job.ID, result.MessageID); err != nil {
+		w.logger.Warn("set aws message ID failed", "job_id", job.ID, "error", err)
 	}
-	if err := logs.UpdateStatus(ctx, job.ID, repository.StatusSent); err != nil {
-		return fmt.Errorf("update status sent: %w", err)
+	if err := w.logs.UpdateStatus(ctx, job.ID, repository.StatusSent); err != nil {
+		return fmt.Errorf("update log status: %w", err)
 	}
-	_ = stats.IncrementStat(ctx, job.ClientID, time.Now().UTC(), "sent")
+
+	// 5. Daily stats.
+	_ = w.stats.IncrementStat(ctx, job.ClientID, time.Now().UTC(), "sent")
 
 	return nil
 }

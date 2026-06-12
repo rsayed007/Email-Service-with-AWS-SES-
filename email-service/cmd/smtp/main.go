@@ -203,7 +203,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 		HTMLBody: htmlBody,
 		TextBody: textBody,
 	}
-	if err := s.backend.emailQueue.Enqueue(ctx, job); err != nil {
+	if err := s.backend.emailQueue.Push(ctx, job); err != nil {
 		return fmt.Errorf("enqueue job: %w", err)
 	}
 	return nil

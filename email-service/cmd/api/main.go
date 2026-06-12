@@ -14,11 +14,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
-	awscfg "github.com/aws/aws-sdk-go-v2/config"
-
 	"email-service/internal/auth"
 	"email-service/internal/config"
-	"email-service/internal/delivery"
 	"email-service/internal/middleware"
 	"email-service/internal/queue"
 	"email-service/internal/ratelimit"
@@ -64,15 +61,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── AWS ───────────────────────────────────────────────────────────────────
-	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(),
-		awscfg.WithRegion(cfg.AWS.Region),
-	)
-	if err != nil {
-		logger.Error("aws config failed", "error", err)
-		os.Exit(1)
-	}
-
 	// ── Repositories ──────────────────────────────────────────────────────────
 	clientRepo := repository.NewClientRepository(db)
 	emailLogRepo := repository.NewEmailLogRepository(db)
@@ -83,7 +71,6 @@ func main() {
 	authenticator := auth.New(clientRepo, rdb, cfg.Security.BcryptCost)
 	limiter := ratelimit.NewRateLimiter(rdb)
 	emailQueue := queue.NewQueue(rdb)
-	_ = delivery.NewSESClient(awsCfg, cfg.AWS.SESConfigurationSet) // sending done by worker
 	tracker := tracking.NewTracker(
 		cfg.Tracking.HMACSecret,
 		cfg.Tracking.BaseURL,
@@ -199,7 +186,7 @@ func main() {
 			TextBody: req.TextBody,
 			ReplyTo:  req.ReplyTo,
 		}
-		if err := emailQueue.Enqueue(c.Request.Context(), job); err != nil {
+		if err := emailQueue.Push(c.Request.Context(), job); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enqueue email"})
 			return
 		}
