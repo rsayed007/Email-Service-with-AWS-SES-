@@ -125,7 +125,8 @@ type WorkerConfig struct {
 
 // SecurityConfig holds security-related settings.
 type SecurityConfig struct {
-	BcryptCost int // BCRYPT_COST
+	BcryptCost  int    // BCRYPT_COST
+	AdminAPIKey string // ADMIN_API_KEY — shared secret for the /admin/* endpoints
 }
 
 // Load reads configuration from the environment, loading a .env file first if present.
@@ -217,6 +218,7 @@ func (c *Config) populate() {
 
 	// Security
 	c.Security.BcryptCost = getEnvInt("BCRYPT_COST", 12)
+	c.Security.AdminAPIKey = os.Getenv("ADMIN_API_KEY")
 }
 
 // validate collects every configuration error and returns them joined.
@@ -263,6 +265,9 @@ func (c *Config) validate() error {
 	// Constraints
 	if c.Security.BcryptCost < 4 || c.Security.BcryptCost > 31 {
 		add("BCRYPT_COST must be between 4 and 31")
+	}
+	if len(c.Security.AdminAPIKey) < 16 {
+		add("ADMIN_API_KEY must be at least 16 characters")
 	}
 	if c.Worker.Concurrency < 1 {
 		add("QUEUE_CONCURRENCY must be >= 1")
