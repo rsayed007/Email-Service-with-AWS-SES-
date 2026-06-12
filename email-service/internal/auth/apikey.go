@@ -6,74 +6,59 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
 	"email-service/internal/repository"
 )
 
-const clientContextKey = "client"
+// clientContextKey is the Gin context key under which the authenticated client
+// is stored by APIKeyMiddleware.
+const clientContextKey = "auth_client"
 
-type APIKeyAuthenticator struct {
-	clients *repository.ClientRepository
-}
+// ClientContextKey returns the Gin context key string used to store the client.
+// Middleware packages that cannot import unexported constants use this accessor.
+func ClientContextKey() string { return clientContextKey }
 
-func NewAPIKeyAuthenticator(clients *repository.ClientRepository) *APIKeyAuthenticator {
-	return &APIKeyAuthenticator{clients: clients}
-}
-
-// Middleware extracts the Bearer token from Authorization header and loads the client.
-func (a *APIKeyAuthenticator) Middleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		header := c.GetHeader("Authorization")
-		apiKey, ok := parseBearerToken(header)
-		if !ok {
-			c.AbortWithStatusJSON(401, gin.H{"error": "missing or invalid Authorization header"})
-			return
-		}
-
-		client, err := a.clients.GetByAPIKey(c.Request.Context(), apiKey)
-		if err != nil {
-			c.AbortWithStatusJSON(401, gin.H{"error": "invalid api key"})
-			return
-		}
-
-		c.Set(clientContextKey, client)
-		c.Next()
-	}
-}
-
+// ClientFromContext retrieves the authenticated client that APIKeyMiddleware
+// stored in the Gin request context.
 func ClientFromContext(c *gin.Context) (*repository.Client, error) {
 	v, exists := c.Get(clientContextKey)
 	if !exists {
-		return nil, fmt.Errorf("client not in context")
+		return nil, fmt.Errorf("client not found in context: middleware may not be applied")
 	}
 	client, ok := v.(*repository.Client)
 	if !ok {
-		return nil, fmt.Errorf("invalid client type in context")
+		return nil, fmt.Errorf("unexpected type in client context key")
 	}
 	return client, nil
 }
 
+// contextKey is the stdlib context.Context key type for the client value.
+type contextKey string
+
+// ClientKey is the key used to store a client in a plain context.Context
+// (outside of Gin, e.g. in the SMTP session).
+const ClientKey contextKey = "auth_client"
+
+// ClientFromCtx retrieves the client stored in a plain context.Context.
+// Returns nil if no client is set.
+func ClientFromCtx(ctx context.Context) *repository.Client {
+	v, _ := ctx.Value(ClientKey).(*repository.Client)
+	return v
+}
+
+// parseBearerToken extracts the token from an "Authorization: Bearer <token>" header.
+// Returns the token and true on success, or empty string and false on failure.
 func parseBearerToken(header string) (string, bool) {
-	parts := strings.SplitN(header, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+	const prefix = "bearer "
+	if len(header) <= len(prefix) {
 		return "", false
 	}
-	token := strings.TrimSpace(parts[1])
+	if !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(header[len(prefix):])
 	if token == "" {
 		return "", false
 	}
 	return token, true
-}
-
-// GenerateAPIKey creates a cryptographically random API key.
-func GenerateAPIKey() (string, error) {
-	return generateRandomHex(32)
-}
-
-type contextKey string
-
-const ClientKey contextKey = "client"
-
-func ClientFromCtx(ctx context.Context) *repository.Client {
-	v, _ := ctx.Value(ClientKey).(*repository.Client)
-	return v
 }

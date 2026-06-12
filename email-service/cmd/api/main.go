@@ -19,6 +19,7 @@ import (
 	"email-service/internal/auth"
 	"email-service/internal/config"
 	"email-service/internal/delivery"
+	"email-service/internal/middleware"
 	"email-service/internal/queue"
 	"email-service/internal/ratelimit"
 	"email-service/internal/repository"
@@ -79,10 +80,10 @@ func main() {
 	blacklistRepo := repository.NewBlacklistRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────────────────
-	apiAuth := auth.NewAPIKeyAuthenticator(clientRepo)
-	limiter := ratelimit.NewLimiter(rdb)
+	authenticator := auth.New(clientRepo, rdb, cfg.Security.BcryptCost)
+	limiter := ratelimit.NewRateLimiter(rdb)
 	emailQueue := queue.NewQueue(rdb)
-	_ = delivery.NewSESClient(awsCfg, cfg.AWS.SESConfigurationSet) // used by worker
+	_ = delivery.NewSESClient(awsCfg, cfg.AWS.SESConfigurationSet) // sending done by worker
 	tracker := tracking.NewTracker(
 		cfg.Tracking.HMACSecret,
 		cfg.Tracking.BaseURL,
@@ -104,7 +105,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// SNS webhook — no auth; AWS signs its own messages.
+	// SNS events — AWS signs its own payloads; no auth middleware here.
 	r.POST("/webhooks/sns", snsHandler.Handle)
 
 	// Open-tracking pixel.
@@ -129,9 +130,10 @@ func main() {
 		c.Redirect(http.StatusFound, tok.URL)
 	})
 
-	// Authenticated REST API.
-	api := r.Group("/api/v1", apiAuth.Middleware())
+	// ── Authenticated REST endpoints ──────────────────────────────────────────
+	api := r.Group("/api/v1", middleware.APIKeyMiddleware(authenticator))
 
+	// POST /api/v1/emails — enqueue a send request
 	api.POST("/emails", func(c *gin.Context) {
 		client, err := auth.ClientFromContext(c)
 		if err != nil {
@@ -152,25 +154,25 @@ func main() {
 			return
 		}
 
-		result, err := limiter.CheckAndIncrement(c.Request.Context(), client.ID,
-			client.HourlyLimit, client.MonthlyLimit)
+		// Atomic dual rate-limit check (hourly sliding window + monthly counter).
+		rl, err := limiter.CheckAll(c.Request.Context(), client.ID, client.HourlyLimit, client.MonthlyLimit)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "rate limit check failed"})
 			return
 		}
-		if !result.Allowed {
+		if !rl.Allowed {
 			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error":    "rate limit exceeded",
-				"reset_at": result.ResetAt,
+				"error":     "rate limit exceeded",
+				"reset_at":  rl.ResetAt,
+				"remaining": rl.Remaining,
 			})
 			return
 		}
 
-		if len(req.To) > 0 {
-			if bl, _ := blacklistRepo.IsBlacklisted(c.Request.Context(), client.ID, req.To[0]); bl {
-				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "recipient is blacklisted"})
-				return
-			}
+		// Blacklist check on the primary recipient.
+		if bl, _ := blacklistRepo.IsBlacklisted(c.Request.Context(), client.ID, req.To[0]); bl {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "recipient is blacklisted"})
+			return
 		}
 
 		logID := uuid.New().String()
@@ -205,9 +207,11 @@ func main() {
 		c.JSON(http.StatusAccepted, gin.H{
 			"message_id": logID,
 			"status":     repository.StatusQueued,
+			"remaining":  rl.Remaining,
 		})
 	})
 
+	// GET /api/v1/emails
 	api.GET("/emails", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		logs, err := emailLogRepo.List(c.Request.Context(), repository.LogFilter{
@@ -222,6 +226,7 @@ func main() {
 		c.JSON(http.StatusOK, logs)
 	})
 
+	// GET /api/v1/emails/:id
 	api.GET("/emails/:id", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		l, err := emailLogRepo.GetByID(c.Request.Context(), c.Param("id"))
@@ -236,6 +241,7 @@ func main() {
 		c.JSON(http.StatusOK, l)
 	})
 
+	// GET /api/v1/stats
 	api.GET("/stats", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		now := time.Now().UTC()
@@ -243,7 +249,7 @@ func main() {
 
 		daily, err := statsRepo.GetRange(c.Request.Context(), client.ID, from, now)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get stats"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get daily stats"})
 			return
 		}
 		summary, err := statsRepo.GetSummary(c.Request.Context(), client.ID, from, now)
@@ -251,17 +257,19 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get summary"})
 			return
 		}
-		hourly, monthly, _ := limiter.CurrentUsage(c.Request.Context(), client.ID)
+		usage, err := limiter.GetCurrentUsage(c.Request.Context(), client.ID, client.HourlyLimit, client.MonthlyLimit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get usage"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"summary":        summary,
-			"daily":          daily,
-			"hourly_usage":   hourly,
-			"monthly_usage":  monthly,
-			"hourly_limit":   client.HourlyLimit,
-			"monthly_limit":  client.MonthlyLimit,
+			"summary": summary,
+			"daily":   daily,
+			"usage":   usage,
 		})
 	})
 
+	// GET /api/v1/blacklist
 	api.GET("/blacklist", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		entries, err := blacklistRepo.List(c.Request.Context(), client.ID)
@@ -272,6 +280,7 @@ func main() {
 		c.JSON(http.StatusOK, entries)
 	})
 
+	// DELETE /api/v1/blacklist/:email
 	api.DELETE("/blacklist/:email", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		if err := blacklistRepo.Remove(c.Request.Context(), client.ID, c.Param("email")); err != nil {
@@ -311,7 +320,7 @@ func main() {
 	logger.Info("API server stopped")
 }
 
-// 1×1 transparent GIF returned by the open-tracking pixel endpoint.
+// transparentGIF is a 1×1 GIF returned by the open-tracking pixel endpoint.
 var transparentGIF = []byte{
 	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
 	0x80, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21,

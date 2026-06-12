@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 
+	"time"
+
 	"github.com/emersion/go-smtp"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -62,16 +64,16 @@ func main() {
 	clientRepo := repository.NewClientRepository(db)
 	emailLogRepo := repository.NewEmailLogRepository(db)
 	emailQueue := queue.NewQueue(rdb)
-	smtpAuth := auth.NewSMTPAuthenticator(clientRepo)
-	limiter := ratelimit.NewLimiter(rdb)
+	authenticator := auth.New(clientRepo, rdb, cfg.Security.BcryptCost)
+	limiter := ratelimit.NewRateLimiter(rdb)
 
 	// ── SMTP server ───────────────────────────────────────────────────────────
 	be := &smtpBackend{
-		cfg:        cfg.SMTP,
-		smtpAuth:   smtpAuth,
-		emailLogs:  emailLogRepo,
-		emailQueue: emailQueue,
-		limiter:    limiter,
+		cfg:           cfg.SMTP,
+		authenticator: authenticator,
+		emailLogs:     emailLogRepo,
+		emailQueue:    emailQueue,
+		limiter:       limiter,
 	}
 
 	s := smtp.NewServer(be)
@@ -104,11 +106,11 @@ func main() {
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 type smtpBackend struct {
-	cfg        config.SMTPConfig
-	smtpAuth   *auth.SMTPAuthenticator
-	emailLogs  *repository.EmailLogRepository
-	emailQueue *queue.Queue
-	limiter    *ratelimit.Limiter
+	cfg           config.SMTPConfig
+	authenticator *auth.Authenticator
+	emailLogs     *repository.EmailLogRepository
+	emailQueue    *queue.Queue
+	limiter       *ratelimit.RateLimiter
 }
 
 func (b *smtpBackend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
@@ -126,9 +128,10 @@ type smtpSession struct {
 
 // AuthPlain is called by go-smtp for both AUTH PLAIN and AUTH LOGIN.
 func (s *smtpSession) AuthPlain(username, password string) error {
-	client, err := s.backend.smtpAuth.Authenticate(context.Background(), username, password)
+	client, err := s.backend.authenticator.ValidateSmtpCredentials(
+		context.Background(), username, password)
 	if err != nil {
-		return fmt.Errorf("authentication failed")
+		return fmt.Errorf("authentication failed: %w", err)
 	}
 	s.client = client
 	return nil
@@ -156,10 +159,14 @@ func (s *smtpSession) Data(r io.Reader) error {
 	}
 	ctx := context.Background()
 
-	result, err := s.backend.limiter.CheckAndIncrement(
-		ctx, s.client.ID, s.client.HourlyLimit, s.client.MonthlyLimit)
-	if err != nil || !result.Allowed {
-		return fmt.Errorf("rate limit exceeded")
+	// Atomic check of both hourly (sliding window) and monthly limits.
+	rl, err := s.backend.limiter.CheckAll(ctx, s.client.ID,
+		s.client.HourlyLimit, s.client.MonthlyLimit)
+	if err != nil {
+		return fmt.Errorf("rate limit check failed")
+	}
+	if !rl.Allowed {
+		return fmt.Errorf("rate limit exceeded, retry after %s", rl.ResetAt.Format(time.RFC1123))
 	}
 
 	rawMsg, err := io.ReadAll(r)
