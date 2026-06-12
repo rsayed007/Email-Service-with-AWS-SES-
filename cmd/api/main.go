@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -14,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"email-service/internal/api"
 	"email-service/internal/auth"
 	"email-service/internal/config"
 	"email-service/internal/middleware"
@@ -62,83 +68,77 @@ func main() {
 	}
 
 	// ── Repositories ──────────────────────────────────────────────────────────
-	clientRepo := repository.NewClientRepository(db)
-	emailLogRepo := repository.NewEmailLogRepository(db)
-	statsRepo := repository.NewStatsRepository(db)
+	clientRepo    := repository.NewClientRepository(db)
+	emailLogRepo  := repository.NewEmailLogRepository(db)
+	statsRepo     := repository.NewStatsRepository(db)
 	blacklistRepo := repository.NewBlacklistRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────────────────
 	authenticator := auth.New(clientRepo, rdb, cfg.Security.BcryptCost)
-	limiter := ratelimit.NewRateLimiter(rdb)
-	emailQueue := queue.NewQueue(rdb)
+	limiter       := ratelimit.NewRateLimiter(rdb)
+	emailQueue    := queue.NewQueue(rdb)
 	trackHandlers := tracking.NewHandlers(emailLogRepo, statsRepo, logger)
-	snsHandler := webhook.NewSNSHandler(emailLogRepo, statsRepo, blacklistRepo, logger)
+	snsHandler    := webhook.NewSNSHandler(emailLogRepo, statsRepo, blacklistRepo, logger)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	if cfg.App.IsProd() {
 		gin.SetMode(gin.ReleaseMode)
 	}
-
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
 
+	// ── Public routes ─────────────────────────────────────────────────────────
+
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"status": "ok"}})
 	})
 
-	// SES event notifications from AWS SNS.
-	// SNSVerifyMiddleware validates the RSA signature before the payload is processed.
+	// SNS webhook — signature verification runs before the handler.
 	r.POST("/webhooks/ses", webhook.SNSVerifyMiddleware(), snsHandler.Handle)
 
-	// Open-tracking pixel: GET /o/:logID
-	r.GET("/o/:logID", trackHandlers.HandleOpen)
+	// ── Tracking (no auth — must respond immediately) ──────────────────────────
 
-	// Click-redirect: GET /c/:logID?u={encoded_url}
-	r.GET("/c/:logID", trackHandlers.HandleClick)
+	r.GET("/o/:logId", trackHandlers.HandleOpen)
+	r.GET("/c/:logId", trackHandlers.HandleClick)
 
-	// ── Authenticated REST endpoints ──────────────────────────────────────────
-	api := r.Group("/api/v1", middleware.APIKeyMiddleware(authenticator))
+	// ── Client API (/v1/*) ────────────────────────────────────────────────────
 
-	// POST /api/v1/emails — enqueue a send request
-	api.POST("/emails", func(c *gin.Context) {
-		client, err := auth.ClientFromContext(c)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-			return
-		}
+	v1 := r.Group("/v1", middleware.APIKeyMiddleware(authenticator))
+
+	// POST /v1/email/send
+	v1.POST("/email/send", func(c *gin.Context) {
+		client, _ := auth.ClientFromContext(c)
 
 		var req struct {
-			From     string   `json:"from"      binding:"required,email"`
-			To       []string `json:"to"        binding:"required,min=1"`
-			Subject  string   `json:"subject"   binding:"required"`
-			HTMLBody string   `json:"html_body"`
-			TextBody string   `json:"text_body"`
-			ReplyTo  string   `json:"reply_to"`
+			To      []string `json:"to"       binding:"required,min=1"`
+			Subject string   `json:"subject"  binding:"required"`
+			HTML    string   `json:"html"`
+			Text    string   `json:"text"`
+			From    string   `json:"from"`
+			ReplyTo string   `json:"reply_to"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			api.Err(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 			return
 		}
+		if req.From == "" {
+			req.From = "noreply@" + cfg.SMTP.Domain
+		}
 
-		// Atomic dual rate-limit check (hourly sliding window + monthly counter).
 		rl, err := limiter.CheckAll(c.Request.Context(), client.ID, client.HourlyLimit, client.MonthlyLimit)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "rate limit check failed"})
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "rate limit check failed")
 			return
 		}
 		if !rl.Allowed {
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error":     "rate limit exceeded",
-				"reset_at":  rl.ResetAt,
-				"remaining": rl.Remaining,
-			})
+			api.Err(c, http.StatusTooManyRequests, "RATE_LIMIT_EXCEEDED",
+				"rate limit exceeded, retry after "+rl.ResetAt.UTC().Format(time.RFC1123))
 			return
 		}
 
-		// Blacklist check on the primary recipient.
 		if bl, _ := blacklistRepo.IsBlacklisted(c.Request.Context(), client.ID, req.To[0]); bl {
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "recipient is blacklisted"})
+			api.Err(c, http.StatusUnprocessableEntity, "RECIPIENT_BLACKLISTED", "recipient is blacklisted")
 			return
 		}
 
@@ -152,7 +152,8 @@ func main() {
 			Status:    repository.StatusQueued,
 		}
 		if err := emailLogRepo.Create(c.Request.Context(), emailLog); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create email record"})
+			logger.Error("create email log failed", "client_id", client.ID, "error", err)
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create email record")
 			return
 		}
 
@@ -162,99 +163,260 @@ func main() {
 			From:     req.From,
 			To:       req.To,
 			Subject:  req.Subject,
-			HTMLBody: req.HTMLBody,
-			TextBody: req.TextBody,
+			HTMLBody: req.HTML,
+			TextBody: req.Text,
 			ReplyTo:  req.ReplyTo,
 		}
 		if err := emailQueue.Push(c.Request.Context(), job); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enqueue email"})
+			logger.Error("queue push failed", "client_id", client.ID, "log_id", logID, "error", err)
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to enqueue email")
 			return
 		}
 
-		c.JSON(http.StatusAccepted, gin.H{
+		api.Accepted(c, gin.H{
 			"message_id": logID,
+			"log_id":     logID,
 			"status":     repository.StatusQueued,
-			"remaining":  rl.Remaining,
 		})
 	})
 
-	// GET /api/v1/emails
-	api.GET("/emails", func(c *gin.Context) {
+	// GET /v1/stats/overview?from=2024-01-01&to=2024-01-31
+	v1.GET("/stats/overview", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
-		logs, err := emailLogRepo.List(c.Request.Context(), repository.LogFilter{
+
+		now := time.Now().UTC()
+		from, to := now.AddDate(0, 0, -30), now
+
+		if s := c.Query("from"); s != "" {
+			if t, err := time.Parse("2006-01-02", s); err == nil {
+				from = t.UTC()
+			}
+		}
+		if s := c.Query("to"); s != "" {
+			if t, err := time.Parse("2006-01-02", s); err == nil {
+				// inclusive: include all events on the to-date
+				to = t.UTC().Add(24*time.Hour - time.Nanosecond)
+			}
+		}
+
+		daily, err := statsRepo.GetRange(c.Request.Context(), client.ID, from, to)
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve daily stats")
+			return
+		}
+		summary, err := statsRepo.GetSummary(c.Request.Context(), client.ID, from, to)
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve summary")
+			return
+		}
+
+		api.OK(c, gin.H{
+			"sent":            summary.Sent,
+			"delivered":       summary.Delivered,
+			"opened":          summary.Opened,
+			"clicked":         summary.Clicked,
+			"bounced":         summary.Bounced,
+			"complained":      summary.Complained,
+			"open_rate":       roundRate(float64(summary.Opened), float64(summary.Delivered)),
+			"bounce_rate":     roundRate(float64(summary.Bounced), float64(summary.Sent)),
+			"daily_breakdown": daily,
+		})
+	})
+
+	// GET /v1/emails?page=1&limit=50&status=delivered
+	v1.GET("/emails", func(c *gin.Context) {
+		client, _ := auth.ClientFromContext(c)
+
+		page  := parseIntQuery(c, "page", 1, 1, 10000)
+		limit := parseIntQuery(c, "limit", 50, 1, 200)
+
+		f := repository.LogFilter{
 			ClientID: client.ID,
 			Status:   c.Query("status"),
-			Limit:    50,
+			Limit:    limit,
+			Offset:   (page - 1) * limit,
+		}
+
+		logs, err := emailLogRepo.List(c.Request.Context(), f)
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list emails")
+			return
+		}
+		// Count uses the same filters but without paging.
+		total, err := emailLogRepo.Count(c.Request.Context(), repository.LogFilter{
+			ClientID: client.ID,
+			Status:   f.Status,
 		})
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list emails"})
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to count emails")
 			return
 		}
-		c.JSON(http.StatusOK, logs)
+
+		api.Page(c, logs, page, limit, total)
 	})
 
-	// GET /api/v1/emails/:id
-	api.GET("/emails/:id", func(c *gin.Context) {
+	// GET /v1/quota
+	v1.GET("/quota", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
-		l, err := emailLogRepo.GetByID(c.Request.Context(), c.Param("id"))
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-			return
-		}
-		if l.ClientID != client.ID {
-			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
-			return
-		}
-		c.JSON(http.StatusOK, l)
-	})
 
-	// GET /api/v1/stats
-	api.GET("/stats", func(c *gin.Context) {
-		client, _ := auth.ClientFromContext(c)
-		now := time.Now().UTC()
-		from := now.AddDate(0, 0, -30)
-
-		daily, err := statsRepo.GetRange(c.Request.Context(), client.ID, from, now)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get daily stats"})
-			return
-		}
-		summary, err := statsRepo.GetSummary(c.Request.Context(), client.ID, from, now)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get summary"})
-			return
-		}
 		usage, err := limiter.GetCurrentUsage(c.Request.Context(), client.ID, client.HourlyLimit, client.MonthlyLimit)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get usage"})
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve quota")
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"summary": summary,
-			"daily":   daily,
-			"usage":   usage,
+		api.OK(c, usage)
+	})
+
+	// ── Admin API (/admin/*) ──────────────────────────────────────────────────
+
+	adm := r.Group("/admin", middleware.AdminKeyMiddleware(cfg.Security.AdminAPIKey))
+
+	// POST /admin/clients — provision a new tenant
+	adm.POST("/clients", func(c *gin.Context) {
+		var req struct {
+			Name         string `json:"name"          binding:"required"`
+			SMTPUsername string `json:"smtp_username" binding:"required"`
+			HourlyLimit  int    `json:"hourly_limit"`
+			MonthlyLimit int    `json:"monthly_limit"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			api.Err(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+			return
+		}
+		if req.HourlyLimit <= 0 {
+			req.HourlyLimit = 100
+		}
+		if req.MonthlyLimit <= 0 {
+			req.MonthlyLimit = 10000
+		}
+
+		apiKey, err := auth.GenerateAPIKey()
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to generate api key")
+			return
+		}
+
+		// Generate a random SMTP password — shown once, stored only as bcrypt hash.
+		smtpPassBytes := make([]byte, 16)
+		if _, err := rand.Read(smtpPassBytes); err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to generate password")
+			return
+		}
+		smtpPassword := base64.RawURLEncoding.EncodeToString(smtpPassBytes)
+
+		passwordHash, err := auth.HashPassword(smtpPassword, cfg.Security.BcryptCost)
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to hash password")
+			return
+		}
+
+		client := &repository.Client{
+			ID:               uuid.New().String(),
+			Name:             req.Name,
+			SMTPUsername:     req.SMTPUsername,
+			SMTPPasswordHash: passwordHash,
+			APIKey:           apiKey,
+			HourlyLimit:      req.HourlyLimit,
+			MonthlyLimit:     req.MonthlyLimit,
+			IsActive:         true,
+		}
+		if err := clientRepo.Create(c.Request.Context(), client); err != nil {
+			if errors.Is(err, repository.ErrDuplicate) {
+				api.Err(c, http.StatusConflict, "DUPLICATE_CLIENT",
+					"smtp_username or api_key already exists")
+				return
+			}
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create client")
+			return
+		}
+
+		api.Created(c, gin.H{
+			"client":        client,
+			"smtp_password": smtpPassword, // plaintext — only returned here
+			"smtp_host":     cfg.SMTP.Domain,
+			"smtp_port":     cfg.SMTP.Port,
 		})
 	})
 
-	// GET /api/v1/blacklist
-	api.GET("/blacklist", func(c *gin.Context) {
-		client, _ := auth.ClientFromContext(c)
-		entries, err := blacklistRepo.List(c.Request.Context(), client.ID)
+	// GET /admin/clients
+	adm.GET("/clients", func(c *gin.Context) {
+		clients, err := clientRepo.List(c.Request.Context())
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list blacklist"})
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list clients")
 			return
 		}
-		c.JSON(http.StatusOK, entries)
+		api.OK(c, clients)
 	})
 
-	// DELETE /api/v1/blacklist/:email
-	api.DELETE("/blacklist/:email", func(c *gin.Context) {
-		client, _ := auth.ClientFromContext(c)
-		if err := blacklistRepo.Remove(c.Request.Context(), client.ID, c.Param("email")); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove from blacklist"})
+	// PUT /admin/clients/:id/status — activate or deactivate a tenant
+	adm.PUT("/clients/:id/status", func(c *gin.Context) {
+		var req struct {
+			IsActive bool `json:"is_active"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			api.Err(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 			return
 		}
-		c.Status(http.StatusNoContent)
+
+		client, err := clientRepo.GetByID(c.Request.Context(), c.Param("id"))
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				api.Err(c, http.StatusNotFound, "NOT_FOUND", "client not found")
+				return
+			}
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve client")
+			return
+		}
+
+		client.IsActive = req.IsActive
+		if err := clientRepo.Update(c.Request.Context(), client); err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update client status")
+			return
+		}
+
+		// Evict cached credentials so the new status takes effect immediately.
+		_ = authenticator.InvalidateCache(c.Request.Context(), client)
+
+		api.OK(c, client)
+	})
+
+	// GET /admin/clients/:id/stats — last-30-days stats for a specific tenant
+	adm.GET("/clients/:id/stats", func(c *gin.Context) {
+		clientID := c.Param("id")
+		if _, err := clientRepo.GetByID(c.Request.Context(), clientID); err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				api.Err(c, http.StatusNotFound, "NOT_FOUND", "client not found")
+				return
+			}
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve client")
+			return
+		}
+
+		now  := time.Now().UTC()
+		from := now.AddDate(0, 0, -30)
+
+		daily, err := statsRepo.GetRange(c.Request.Context(), clientID, from, now)
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve daily stats")
+			return
+		}
+		summary, err := statsRepo.GetSummary(c.Request.Context(), clientID, from, now)
+		if err != nil {
+			api.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to retrieve summary")
+			return
+		}
+
+		api.OK(c, gin.H{
+			"sent":            summary.Sent,
+			"delivered":       summary.Delivered,
+			"opened":          summary.Opened,
+			"clicked":         summary.Clicked,
+			"bounced":         summary.Bounced,
+			"complained":      summary.Complained,
+			"open_rate":       roundRate(float64(summary.Opened), float64(summary.Delivered)),
+			"bounce_rate":     roundRate(float64(summary.Bounced), float64(summary.Sent)),
+			"daily_breakdown": daily,
+		})
 	})
 
 	// ── HTTP server with graceful shutdown ────────────────────────────────────
@@ -285,6 +447,30 @@ func main() {
 		logger.Error("shutdown error", "error", err)
 	}
 	logger.Info("API server stopped")
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+// roundRate returns numerator/denominator rounded to 4 decimal places,
+// or 0 when denominator is zero.
+func roundRate(numerator, denominator float64) float64 {
+	if denominator == 0 {
+		return 0
+	}
+	return math.Round(numerator/denominator*10000) / 10000
+}
+
+// parseIntQuery reads a query param as int, clamping to [min, max] and falling
+// back to defaultVal when absent or unparseable.
+func parseIntQuery(c *gin.Context, key string, defaultVal, min, max int) int {
+	v, err := strconv.Atoi(c.Query(key))
+	if err != nil || v < min {
+		return defaultVal
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func newLogger(level string) *slog.Logger {
