@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,100 +12,116 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 
 	"email-service/internal/auth"
+	"email-service/internal/config"
 	"email-service/internal/delivery"
 	"email-service/internal/queue"
 	"email-service/internal/ratelimit"
 	"email-service/internal/repository"
 	"email-service/internal/tracking"
 	"email-service/internal/webhook"
+	"email-service/pkg/database"
 )
 
 func main() {
-	_ = godotenv.Load()
-
-	db, err := repository.NewDB(repository.Config{
-		Host:            mustEnv("MYSQL_HOST"),
-		Port:            getEnv("MYSQL_PORT", "3306"),
-		User:            mustEnv("MYSQL_USER"),
-		Password:        mustEnv("MYSQL_PASSWORD"),
-		Database:        mustEnv("MYSQL_DATABASE"),
-		MaxOpenConns:    25,
-		MaxIdleConns:    10,
-		ConnMaxLifetime: 5 * time.Minute,
-	})
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("database: %v", err)
+		log.Fatalf("config: %v", err)
+	}
+
+	logger := newLogger(cfg.App.LogLevel)
+
+	// ── Database ──────────────────────────────────────────────────────────────
+	db, err := repository.NewDB(cfg.Database)
+	if err != nil {
+		logger.Error("database connect failed", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
+	if err := database.RunMigrations(db.DB, cfg.Database); err != nil {
+		logger.Error("migrations failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("database migrations up to date", "dsn", cfg.Database.SafeDSN())
+
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%s", mustEnv("REDIS_HOST"), getEnv("REDIS_PORT", "6379")),
-		Password: os.Getenv("REDIS_PASSWORD"),
-		DB:       0,
+		Addr:     cfg.Redis.Addr(),
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+		PoolSize: cfg.Redis.PoolSize,
 	})
 	defer rdb.Close()
 
-	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(),
-		awscfg.WithRegion(mustEnv("AWS_REGION")),
-	)
-	if err != nil {
-		log.Fatalf("aws config: %v", err)
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		logger.Error("redis ping failed", "error", err)
+		os.Exit(1)
 	}
 
-	// Repositories
+	// ── AWS ───────────────────────────────────────────────────────────────────
+	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(),
+		awscfg.WithRegion(cfg.AWS.Region),
+	)
+	if err != nil {
+		logger.Error("aws config failed", "error", err)
+		os.Exit(1)
+	}
+
+	// ── Repositories ──────────────────────────────────────────────────────────
 	clientRepo := repository.NewClientRepository(db)
 	emailLogRepo := repository.NewEmailLogRepository(db)
 	statsRepo := repository.NewStatsRepository(db)
 	blacklistRepo := repository.NewBlacklistRepository(db)
 
-	// Services
+	// ── Services ──────────────────────────────────────────────────────────────
 	apiAuth := auth.NewAPIKeyAuthenticator(clientRepo)
 	limiter := ratelimit.NewLimiter(rdb)
 	emailQueue := queue.NewQueue(rdb)
-	sesClient := delivery.NewSESClient(awsCfg, os.Getenv("SES_CONFIGURATION_SET"))
+	_ = delivery.NewSESClient(awsCfg, cfg.AWS.SESConfigurationSet) // used by worker
 	tracker := tracking.NewTracker(
-		[]byte(mustEnv("TRACKING_HMAC_SECRET")),
-		mustEnv("TRACKING_BASE_URL"),
-		getEnv("TRACKING_PIXEL_PATH", "/t/open"),
-		getEnv("TRACKING_CLICK_PATH", "/t/click"),
+		cfg.Tracking.HMACSecret,
+		cfg.Tracking.BaseURL,
+		cfg.Tracking.PixelPath,
+		cfg.Tracking.ClickPath,
 	)
 	snsHandler := webhook.NewSNSHandler(emailLogRepo, statsRepo, blacklistRepo)
-	_ = sesClient // used via queue worker; kept for direct-send option
+
+	// ── Router ────────────────────────────────────────────────────────────────
+	if cfg.App.IsProd() {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
 
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// ── SNS webhook (no auth required — SNS signs its own messages) ──────────
+	// SNS webhook — no auth; AWS signs its own messages.
 	r.POST("/webhooks/sns", snsHandler.Handle)
 
-	// ── Tracking endpoints ────────────────────────────────────────────────────
-	r.GET("/t/open", func(c *gin.Context) {
-		tokenStr := c.Query("t")
-		tok, err := tracker.Verify(tokenStr)
+	// Open-tracking pixel.
+	r.GET(cfg.Tracking.PixelPath, func(c *gin.Context) {
+		tok, err := tracker.Verify(c.Query("t"))
 		if err == nil {
 			_ = emailLogRepo.UpdateStatus(c.Request.Context(), tok.LogID, repository.StatusOpened)
 			_ = statsRepo.IncrementStat(c.Request.Context(), tok.ClientID, time.Now().UTC(), "opened")
 		}
-		// Return 1x1 transparent GIF
-		c.Data(200, "image/gif", transparentGIF)
+		c.Data(http.StatusOK, "image/gif", transparentGIF)
 	})
 
-	r.GET("/t/click", func(c *gin.Context) {
-		tokenStr := c.Query("t")
-		tok, err := tracker.Verify(tokenStr)
+	// Click-redirect.
+	r.GET(cfg.Tracking.ClickPath, func(c *gin.Context) {
+		tok, err := tracker.Verify(c.Query("t"))
 		if err != nil || tok.URL == "" {
-			c.Status(400)
+			c.Status(http.StatusBadRequest)
 			return
 		}
 		_ = emailLogRepo.UpdateStatus(c.Request.Context(), tok.LogID, repository.StatusClicked)
@@ -113,55 +129,51 @@ func main() {
 		c.Redirect(http.StatusFound, tok.URL)
 	})
 
-	// ── Authenticated API ─────────────────────────────────────────────────────
+	// Authenticated REST API.
 	api := r.Group("/api/v1", apiAuth.Middleware())
 
-	// Send email
 	api.POST("/emails", func(c *gin.Context) {
 		client, err := auth.ClientFromContext(c)
 		if err != nil {
-			c.JSON(500, gin.H{"error": "internal error"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
 
 		var req struct {
-			From     string   `json:"from"     binding:"required,email"`
-			To       []string `json:"to"       binding:"required,min=1"`
-			Subject  string   `json:"subject"  binding:"required"`
+			From     string   `json:"from"      binding:"required,email"`
+			To       []string `json:"to"        binding:"required,min=1"`
+			Subject  string   `json:"subject"   binding:"required"`
 			HTMLBody string   `json:"html_body"`
 			TextBody string   `json:"text_body"`
 			ReplyTo  string   `json:"reply_to"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
-		// Rate limit check
-		result, err := limiter.CheckAndIncrement(c.Request.Context(), client.ID, client.HourlyLimit, client.MonthlyLimit)
+		result, err := limiter.CheckAndIncrement(c.Request.Context(), client.ID,
+			client.HourlyLimit, client.MonthlyLimit)
 		if err != nil {
-			c.JSON(500, gin.H{"error": "rate limit check failed"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "rate limit check failed"})
 			return
 		}
 		if !result.Allowed {
-			c.JSON(429, gin.H{
+			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error":    "rate limit exceeded",
 				"reset_at": result.ResetAt,
 			})
 			return
 		}
 
-		// Blacklist check (only first recipient for simplicity; worker checks all)
 		if len(req.To) > 0 {
-			blacklisted, _ := blacklistRepo.IsBlacklisted(c.Request.Context(), client.ID, req.To[0])
-			if blacklisted {
-				c.JSON(422, gin.H{"error": "recipient is blacklisted"})
+			if bl, _ := blacklistRepo.IsBlacklisted(c.Request.Context(), client.ID, req.To[0]); bl {
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "recipient is blacklisted"})
 				return
 			}
 		}
 
 		logID := uuid.New().String()
-
 		emailLog := &repository.EmailLog{
 			ID:        logID,
 			ClientID:  client.ID,
@@ -171,7 +183,7 @@ func main() {
 			Status:    repository.StatusQueued,
 		}
 		if err := emailLogRepo.Create(c.Request.Context(), emailLog); err != nil {
-			c.JSON(500, gin.H{"error": "failed to create email log"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create email record"})
 			return
 		}
 
@@ -186,17 +198,16 @@ func main() {
 			ReplyTo:  req.ReplyTo,
 		}
 		if err := emailQueue.Enqueue(c.Request.Context(), job); err != nil {
-			c.JSON(500, gin.H{"error": "failed to enqueue email"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enqueue email"})
 			return
 		}
 
-		c.JSON(202, gin.H{
+		c.JSON(http.StatusAccepted, gin.H{
 			"message_id": logID,
-			"status":     "queued",
+			"status":     repository.StatusQueued,
 		})
 	})
 
-	// List emails
 	api.GET("/emails", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		logs, err := emailLogRepo.List(c.Request.Context(), repository.LogFilter{
@@ -205,40 +216,45 @@ func main() {
 			Limit:    50,
 		})
 		if err != nil {
-			c.JSON(500, gin.H{"error": "failed to list emails"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list emails"})
 			return
 		}
-		c.JSON(200, logs)
+		c.JSON(http.StatusOK, logs)
 	})
 
-	// Get single email
 	api.GET("/emails/:id", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
-		log, err := emailLogRepo.GetByID(c.Request.Context(), c.Param("id"))
+		l, err := emailLogRepo.GetByID(c.Request.Context(), c.Param("id"))
 		if err != nil {
-			c.JSON(404, gin.H{"error": "not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}
-		if log.ClientID != client.ID {
-			c.JSON(403, gin.H{"error": "forbidden"})
+		if l.ClientID != client.ID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 			return
 		}
-		c.JSON(200, log)
+		c.JSON(http.StatusOK, l)
 	})
 
-	// Stats
 	api.GET("/stats", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
-		from := time.Now().UTC().AddDate(0, 0, -30)
-		to := time.Now().UTC()
-		stats, err := statsRepo.GetRange(c.Request.Context(), client.ID, from, to)
+		now := time.Now().UTC()
+		from := now.AddDate(0, 0, -30)
+
+		daily, err := statsRepo.GetRange(c.Request.Context(), client.ID, from, now)
 		if err != nil {
-			c.JSON(500, gin.H{"error": "failed to get stats"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get stats"})
+			return
+		}
+		summary, err := statsRepo.GetSummary(c.Request.Context(), client.ID, from, now)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get summary"})
 			return
 		}
 		hourly, monthly, _ := limiter.CurrentUsage(c.Request.Context(), client.ID)
-		c.JSON(200, gin.H{
-			"daily":          stats,
+		c.JSON(http.StatusOK, gin.H{
+			"summary":        summary,
+			"daily":          daily,
 			"hourly_usage":   hourly,
 			"monthly_usage":  monthly,
 			"hourly_limit":   client.HourlyLimit,
@@ -246,56 +262,56 @@ func main() {
 		})
 	})
 
-	// Blacklist
 	api.GET("/blacklist", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		entries, err := blacklistRepo.List(c.Request.Context(), client.ID)
 		if err != nil {
-			c.JSON(500, gin.H{"error": "failed to list blacklist"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list blacklist"})
 			return
 		}
-		c.JSON(200, entries)
+		c.JSON(http.StatusOK, entries)
 	})
 
 	api.DELETE("/blacklist/:email", func(c *gin.Context) {
 		client, _ := auth.ClientFromContext(c)
 		if err := blacklistRepo.Remove(c.Request.Context(), client.ID, c.Param("email")); err != nil {
-			c.JSON(500, gin.H{"error": "failed to remove from blacklist"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove from blacklist"})
 			return
 		}
-		c.Status(204)
+		c.Status(http.StatusNoContent)
 	})
 
-	port := getEnv("API_PORT", "8080")
+	// ── HTTP server with graceful shutdown ────────────────────────────────────
 	srv := &http.Server{
-		Addr:         ":" + port,
+		Addr:         ":" + cfg.APIServer.Port,
 		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.APIServer.ReadTimeout,
+		WriteTimeout: cfg.APIServer.WriteTimeout,
+		IdleTimeout:  cfg.APIServer.IdleTimeout,
 	}
 
 	go func() {
-		log.Printf("API server listening on :%s", port)
+		logger.Info("API server starting", "port", cfg.APIServer.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+			logger.Error("API server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("shutting down API server...")
+	logger.Info("API server shutting down")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("server shutdown: %v", err)
+		logger.Error("shutdown error", "error", err)
 	}
-	log.Println("API server stopped")
+	logger.Info("API server stopped")
 }
 
-// 1x1 transparent GIF
+// 1×1 transparent GIF returned by the open-tracking pixel endpoint.
 var transparentGIF = []byte{
 	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
 	0x80, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21,
@@ -304,17 +320,17 @@ var transparentGIF = []byte{
 	0x01, 0x00, 0x3b,
 }
 
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("required env var %s is not set", key)
+func newLogger(level string) *slog.Logger {
+	var l slog.Level
+	switch level {
+	case "debug":
+		l = slog.LevelDebug
+	case "warn":
+		l = slog.LevelWarn
+	case "error":
+		l = slog.LevelError
+	default:
+		l = slog.LevelInfo
 	}
-	return v
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
 }

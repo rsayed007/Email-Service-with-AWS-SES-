@@ -4,123 +4,143 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 
+	"email-service/internal/config"
 	"email-service/internal/delivery"
 	"email-service/internal/queue"
 	"email-service/internal/repository"
+	"email-service/pkg/database"
 )
 
 func main() {
-	_ = godotenv.Load()
-
-	db, err := repository.NewDB(repository.Config{
-		Host:            mustEnv("MYSQL_HOST"),
-		Port:            getEnv("MYSQL_PORT", "3306"),
-		User:            mustEnv("MYSQL_USER"),
-		Password:        mustEnv("MYSQL_PASSWORD"),
-		Database:        mustEnv("MYSQL_DATABASE"),
-		MaxOpenConns:    10,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: 5 * time.Minute,
-	})
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("database: %v", err)
+		log.Fatalf("config: %v", err)
+	}
+
+	logger := newLogger(cfg.App.LogLevel)
+
+	// ── Database ──────────────────────────────────────────────────────────────
+	db, err := repository.NewDB(cfg.Database)
+	if err != nil {
+		logger.Error("database connect failed", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
+	if err := database.RunMigrations(db.DB, cfg.Database); err != nil {
+		logger.Error("migrations failed", "error", err)
+		os.Exit(1)
+	}
+
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%s", mustEnv("REDIS_HOST"), getEnv("REDIS_PORT", "6379")),
-		Password: os.Getenv("REDIS_PASSWORD"),
-		DB:       0,
+		Addr:     cfg.Redis.Addr(),
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+		PoolSize: cfg.Redis.PoolSize,
 	})
 	defer rdb.Close()
 
+	// ── AWS ───────────────────────────────────────────────────────────────────
 	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(),
-		awscfg.WithRegion(mustEnv("AWS_REGION")),
+		awscfg.WithRegion(cfg.AWS.Region),
 	)
 	if err != nil {
-		log.Fatalf("aws config: %v", err)
+		logger.Error("aws config failed", "error", err)
+		os.Exit(1)
 	}
 
+	// ── Dependencies ──────────────────────────────────────────────────────────
 	emailLogRepo := repository.NewEmailLogRepository(db)
 	statsRepo := repository.NewStatsRepository(db)
 	blacklistRepo := repository.NewBlacklistRepository(db)
-	sesClient := delivery.NewSESClient(awsCfg, os.Getenv("SES_CONFIGURATION_SET"))
+	sesClient := delivery.NewSESClient(awsCfg, cfg.AWS.SESConfigurationSet)
 	emailQueue := queue.NewQueue(rdb)
 
-	concurrency := 10
-	maxRetries := 3
-
+	// ── Worker pool ───────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < cfg.Worker.Concurrency; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(id int) {
 			defer wg.Done()
-			runWorker(ctx, workerID, emailQueue, sesClient, emailLogRepo, statsRepo, blacklistRepo, maxRetries)
+			runWorker(ctx, id, logger, cfg.Queue,
+				emailQueue, sesClient, emailLogRepo, statsRepo, blacklistRepo)
 		}(i)
 	}
+	logger.Info("worker pool started", "concurrency", cfg.Worker.Concurrency)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("worker shutting down...")
+	logger.Info("worker pool shutting down")
 	cancel()
 	wg.Wait()
-	log.Println("worker stopped")
+	logger.Info("worker pool stopped")
 }
 
 func runWorker(
 	ctx context.Context,
 	id int,
+	logger *slog.Logger,
+	qcfg config.QueueConfig,
 	q *queue.Queue,
 	ses *delivery.SESClient,
 	logs *repository.EmailLogRepository,
 	stats *repository.StatsRepository,
 	blacklist *repository.BlacklistRepository,
-	maxRetries int,
 ) {
-	log.Printf("worker %d started", id)
+	logger.Debug("worker started", "worker_id", id)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("worker %d stopping", id)
+			logger.Debug("worker stopped", "worker_id", id)
 			return
 		default:
 		}
 
 		job, err := q.Dequeue(ctx, 5*time.Second)
 		if err != nil {
-			log.Printf("worker %d dequeue error: %v", id, err)
+			logger.Error("dequeue error", "worker_id", id, "error", err)
 			continue
 		}
 		if job == nil {
 			continue // timeout, no job available
 		}
 
+		logger.Info("processing job", "worker_id", id, "job_id", job.ID, "attempt", job.Attempts+1)
+
 		if err := processJob(ctx, job, ses, logs, stats, blacklist); err != nil {
-			log.Printf("worker %d job %s failed (attempt %d): %v", id, job.ID, job.Attempts+1, err)
-			if job.Attempts < maxRetries {
+			logger.Error("job failed", "worker_id", id, "job_id", job.ID,
+				"attempt", job.Attempts+1, "error", err)
+
+			if job.Attempts < qcfg.MaxRetries {
+				time.Sleep(qcfg.RetryDelay)
 				if reqErr := q.Requeue(ctx, job); reqErr != nil {
-					log.Printf("worker %d requeue error: %v", id, reqErr)
+					logger.Error("requeue error", "worker_id", id, "job_id", job.ID, "error", reqErr)
 				}
 			} else {
-				log.Printf("worker %d job %s exhausted retries, marking failed", id, job.ID)
+				logger.Warn("job exhausted retries, marking failed",
+					"worker_id", id, "job_id", job.ID)
 				_ = logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
 			}
+			continue
 		}
+
+		logger.Info("job completed", "worker_id", id, "job_id", job.ID)
 	}
 }
 
@@ -132,19 +152,20 @@ func processJob(
 	stats *repository.StatsRepository,
 	blacklist *repository.BlacklistRepository,
 ) error {
-	// Filter out blacklisted recipients.
+	// Filter blacklisted recipients before calling SES.
 	validTo := make([]string, 0, len(job.To))
 	for _, addr := range job.To {
 		bl, err := blacklist.IsBlacklisted(ctx, job.ClientID, addr)
-		if err != nil || bl {
-			log.Printf("job %s: skipping blacklisted recipient %s", job.ID, addr)
-			continue
+		if err != nil {
+			return fmt.Errorf("blacklist check for %s: %w", addr, err)
 		}
-		validTo = append(validTo, addr)
+		if !bl {
+			validTo = append(validTo, addr)
+		}
 	}
+
 	if len(validTo) == 0 {
-		_ = logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
-		return nil
+		return logs.UpdateStatus(ctx, job.ID, repository.StatusFailed)
 	}
 
 	req := delivery.SendRequest{
@@ -164,31 +185,32 @@ func processJob(
 
 	result, err := ses.Send(ctx, req)
 	if err != nil {
-		return fmt.Errorf("ses send: %w", err)
+		return fmt.Errorf("ses.Send: %w", err)
 	}
 
 	if err := logs.SetAWSMessageID(ctx, job.ID, result.MessageID); err != nil {
-		log.Printf("set aws message id: %v", err)
+		// Non-fatal: continue so the status update still happens.
+		_ = err
 	}
 	if err := logs.UpdateStatus(ctx, job.ID, repository.StatusSent); err != nil {
-		log.Printf("update status sent: %v", err)
+		return fmt.Errorf("update status sent: %w", err)
 	}
 	_ = stats.IncrementStat(ctx, job.ClientID, time.Now().UTC(), "sent")
 
 	return nil
 }
 
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("required env var %s is not set", key)
+func newLogger(level string) *slog.Logger {
+	var l slog.Level
+	switch level {
+	case "debug":
+		l = slog.LevelDebug
+	case "warn":
+		l = slog.LevelWarn
+	case "error":
+		l = slog.LevelError
+	default:
+		l = slog.LevelInfo
 	}
-	return v
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -14,54 +15,59 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/emersion/go-smtp"
 	"github.com/google/uuid"
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
 	"email-service/internal/auth"
+	"email-service/internal/config"
 	"email-service/internal/queue"
 	"email-service/internal/ratelimit"
 	"email-service/internal/repository"
+	"email-service/pkg/database"
 )
 
 func main() {
-	_ = godotenv.Load()
-
-	db, err := repository.NewDB(repository.Config{
-		Host:            mustEnv("MYSQL_HOST"),
-		Port:            getEnv("MYSQL_PORT", "3306"),
-		User:            mustEnv("MYSQL_USER"),
-		Password:        mustEnv("MYSQL_PASSWORD"),
-		Database:        mustEnv("MYSQL_DATABASE"),
-		MaxOpenConns:    10,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: 5 * time.Minute,
-	})
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("database: %v", err)
+		log.Fatalf("config: %v", err)
+	}
+
+	logger := newLogger(cfg.App.LogLevel)
+
+	// ── Database ──────────────────────────────────────────────────────────────
+	db, err := repository.NewDB(cfg.Database)
+	if err != nil {
+		logger.Error("database connect failed", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
+	if err := database.RunMigrations(db.DB, cfg.Database); err != nil {
+		logger.Error("migrations failed", "error", err)
+		os.Exit(1)
+	}
+
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%s", mustEnv("REDIS_HOST"), getEnv("REDIS_PORT", "6379")),
-		Password: os.Getenv("REDIS_PASSWORD"),
-		DB:       0,
+		Addr:     cfg.Redis.Addr(),
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+		PoolSize: cfg.Redis.PoolSize,
 	})
 	defer rdb.Close()
 
+	// ── Dependencies ──────────────────────────────────────────────────────────
 	clientRepo := repository.NewClientRepository(db)
 	emailLogRepo := repository.NewEmailLogRepository(db)
 	emailQueue := queue.NewQueue(rdb)
 	smtpAuth := auth.NewSMTPAuthenticator(clientRepo)
 	limiter := ratelimit.NewLimiter(rdb)
 
-	domain := getEnv("SMTP_DOMAIN", "mail.example.com")
-	port := getEnv("SMTP_PORT", "2525")
-
+	// ── SMTP server ───────────────────────────────────────────────────────────
 	be := &smtpBackend{
+		cfg:        cfg.SMTP,
 		smtpAuth:   smtpAuth,
 		emailLogs:  emailLogRepo,
 		emailQueue: emailQueue,
@@ -69,34 +75,36 @@ func main() {
 	}
 
 	s := smtp.NewServer(be)
-	s.Addr = ":" + port
-	s.Domain = domain
-	s.ReadTimeout = 30 * time.Second
-	s.WriteTimeout = 30 * time.Second
-	s.MaxMessageBytes = 10 * 1024 * 1024 // 10 MB
-	s.MaxRecipients = 50
-	s.AllowInsecureAuth = true // set to false in production with TLS
+	s.Addr = ":" + cfg.SMTP.Port
+	s.Domain = cfg.SMTP.Domain
+	s.ReadTimeout = cfg.SMTP.ReadTimeout
+	s.WriteTimeout = cfg.SMTP.WriteTimeout
+	s.MaxMessageBytes = cfg.SMTP.MaxMessageBytes
+	s.MaxRecipients = cfg.SMTP.MaxRecipients
+	s.AllowInsecureAuth = cfg.SMTP.AllowInsecureAuth
 
 	go func() {
-		log.Printf("SMTP proxy listening on :%s (domain: %s)", port, domain)
+		logger.Info("SMTP server starting", "port", cfg.SMTP.Port, "domain", cfg.SMTP.Domain)
 		if err := s.ListenAndServe(); err != nil {
-			log.Fatalf("smtp server: %v", err)
+			logger.Error("SMTP server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("SMTP server shutting down...")
+	logger.Info("SMTP server shutting down")
 	if err := s.Close(); err != nil {
-		log.Printf("smtp close: %v", err)
+		logger.Error("SMTP close error", "error", err)
 	}
-	log.Println("SMTP server stopped")
+	logger.Info("SMTP server stopped")
 }
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 type smtpBackend struct {
+	cfg        config.SMTPConfig
 	smtpAuth   *auth.SMTPAuthenticator
 	emailLogs  *repository.EmailLogRepository
 	emailQueue *queue.Queue
@@ -104,9 +112,7 @@ type smtpBackend struct {
 }
 
 func (b *smtpBackend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
-	return &smtpSession{
-		backend: b,
-	}, nil
+	return &smtpSession{backend: b}, nil
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -118,7 +124,7 @@ type smtpSession struct {
 	to      []string
 }
 
-// AuthPlain is called for both AUTH PLAIN and AUTH LOGIN by go-smtp.
+// AuthPlain is called by go-smtp for both AUTH PLAIN and AUTH LOGIN.
 func (s *smtpSession) AuthPlain(username, password string) error {
 	client, err := s.backend.smtpAuth.Authenticate(context.Background(), username, password)
 	if err != nil {
@@ -150,7 +156,8 @@ func (s *smtpSession) Data(r io.Reader) error {
 	}
 	ctx := context.Background()
 
-	result, err := s.backend.limiter.CheckAndIncrement(ctx, s.client.ID, s.client.HourlyLimit, s.client.MonthlyLimit)
+	result, err := s.backend.limiter.CheckAndIncrement(
+		ctx, s.client.ID, s.client.HourlyLimit, s.client.MonthlyLimit)
 	if err != nil || !result.Allowed {
 		return fmt.Errorf("rate limit exceeded")
 	}
@@ -200,11 +207,9 @@ func (s *smtpSession) Reset() {
 	s.to = nil
 }
 
-func (s *smtpSession) Logout() error {
-	return nil
-}
+func (s *smtpSession) Logout() error { return nil }
 
-// ── RFC 2822 message parser ───────────────────────────────────────────────────
+// ── RFC 2822 parser ───────────────────────────────────────────────────────────
 
 func parseRawMessage(raw []byte) (subject, htmlBody, textBody string) {
 	msg, err := mail.ReadMessage(bytes.NewReader(raw))
@@ -227,8 +232,7 @@ func parseRawMessage(raw []byte) (subject, htmlBody, textBody string) {
 			if err != nil {
 				break
 			}
-			partCT := part.Header.Get("Content-Type")
-			partMedia, _, _ := mime.ParseMediaType(partCT)
+			partMedia, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 			body := readPart(part)
 			switch partMedia {
 			case "text/html":
@@ -248,24 +252,24 @@ func parseRawMessage(raw []byte) (subject, htmlBody, textBody string) {
 }
 
 func readPart(r io.Reader) string {
-	b, _ := io.ReadAll(quotedprintable.NewReader(r))
-	if len(b) == 0 {
+	b, err := io.ReadAll(quotedprintable.NewReader(r))
+	if err != nil || len(b) == 0 {
 		b, _ = io.ReadAll(r)
 	}
 	return string(b)
 }
 
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("required env var %s is not set", key)
+func newLogger(level string) *slog.Logger {
+	var l slog.Level
+	switch level {
+	case "debug":
+		l = slog.LevelDebug
+	case "warn":
+		l = slog.LevelWarn
+	case "error":
+		l = slog.LevelError
+	default:
+		l = slog.LevelInfo
 	}
-	return v
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
 }

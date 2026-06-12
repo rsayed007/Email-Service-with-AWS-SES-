@@ -6,35 +6,33 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+
+	"email-service/internal/config"
 )
 
-type Config struct {
-	Host            string
-	Port            string
-	User            string
-	Password        string
-	Database        string
-	MaxOpenConns    int
-	MaxIdleConns    int
-	ConnMaxLifetime time.Duration
-}
-
-func NewDB(cfg Config) (*sqlx.DB, error) {
-	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci",
-		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database,
-	)
-	db, err := sqlx.Open("mysql", dsn)
+// NewDB opens and verifies a MySQL connection using cfg. It retries the ping
+// with exponential backoff to accommodate docker-compose startup ordering.
+func NewDB(cfg config.DatabaseConfig) (db *sqlx.DB, err error) {
+	db, err = sqlx.Open("mysql", cfg.DSN())
 	if err != nil {
-		return nil, fmt.Errorf("open mysql: %w", err)
+		return nil, fmt.Errorf("open mysql (%s): %w", cfg.SafeDSN(), err)
 	}
 
 	db.SetMaxOpenConns(cfg.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("ping mysql: %w", err)
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = db.Ping(); err == nil {
+			return db, nil
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		time.Sleep(time.Duration(attempt*attempt) * time.Second)
 	}
-	return db, nil
+
+	db.Close()
+	return nil, fmt.Errorf("ping mysql after %d attempts (%s): %w", maxAttempts, cfg.SafeDSN(), err)
 }

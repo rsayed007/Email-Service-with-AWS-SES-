@@ -49,10 +49,16 @@ tidy:
 DB_DSN ?= "mysql://$(MYSQL_USER):$(MYSQL_PASSWORD)@tcp($(MYSQL_HOST):$(MYSQL_PORT))/$(MYSQL_DATABASE)"
 
 migrate-up:
-	migrate -path ./migrations -database $(DB_DSN) up
+	migrate -path ./pkg/database/migrations -database $(DB_DSN) up
 
 migrate-down:
-	migrate -path ./migrations -database $(DB_DSN) down
+	migrate -path ./pkg/database/migrations -database $(DB_DSN) down
+
+migrate-version:
+	migrate -path ./pkg/database/migrations -database $(DB_DSN) version
+
+migrate-force:
+	migrate -path ./pkg/database/migrations -database $(DB_DSN) force $(VERSION)
 
 ## ── Docker ───────────────────────────────────────────────────────────────────
 docker-up:
