@@ -64,14 +64,9 @@ func main() {
 
 	// ── Worker ────────────────────────────────────────────────────────────────
 	w := &Worker{
-		queue: queue.NewQueue(rdb),
-		ses:   delivery.NewSESDelivery(awsCfg, cfg.AWS.SNSTopicARN),
-		tracker: tracking.NewTracker(
-			cfg.Tracking.HMACSecret,
-			cfg.Tracking.BaseURL,
-			cfg.Tracking.PixelPath,
-			cfg.Tracking.ClickPath,
-		),
+		queue:     queue.NewQueue(rdb),
+		ses:       delivery.NewSESDelivery(awsCfg, cfg.AWS.SNSTopicARN),
+		injector:  tracking.NewInjector(cfg.Tracking.BaseURL),
 		logs:      repository.NewEmailLogRepository(db),
 		stats:     repository.NewStatsRepository(db),
 		blacklist: repository.NewBlacklistRepository(db),
@@ -100,7 +95,7 @@ func main() {
 type Worker struct {
 	queue     *queue.Queue
 	ses       *delivery.SESDelivery
-	tracker   *tracking.Tracker
+	injector  *tracking.Injector
 	logs      *repository.EmailLogRepository
 	stats     *repository.StatsRepository
 	blacklist *repository.BlacklistRepository
@@ -211,7 +206,8 @@ func (w *Worker) processJob(ctx context.Context, job *queue.EmailJob) error {
 	// 2. Tracking injection.
 	htmlBody := job.HTMLBody
 	if htmlBody != "" {
-		htmlBody = w.tracker.InjectTracking(htmlBody, job.ID, job.ClientID)
+		htmlBody = w.injector.InjectClickTracking(htmlBody, job.ID)
+		htmlBody = w.injector.InjectOpenPixel(htmlBody, job.ID)
 	}
 
 	// 3. SES delivery.

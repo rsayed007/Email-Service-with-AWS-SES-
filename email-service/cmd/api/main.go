@@ -71,12 +71,7 @@ func main() {
 	authenticator := auth.New(clientRepo, rdb, cfg.Security.BcryptCost)
 	limiter := ratelimit.NewRateLimiter(rdb)
 	emailQueue := queue.NewQueue(rdb)
-	tracker := tracking.NewTracker(
-		cfg.Tracking.HMACSecret,
-		cfg.Tracking.BaseURL,
-		cfg.Tracking.PixelPath,
-		cfg.Tracking.ClickPath,
-	)
+	trackHandlers := tracking.NewHandlers(emailLogRepo, statsRepo, logger)
 	snsHandler := webhook.NewSNSHandler(emailLogRepo, statsRepo, blacklistRepo)
 
 	// ── Router ────────────────────────────────────────────────────────────────
@@ -95,27 +90,11 @@ func main() {
 	// SNS events — AWS signs its own payloads; no auth middleware here.
 	r.POST("/webhooks/sns", snsHandler.Handle)
 
-	// Open-tracking pixel.
-	r.GET(cfg.Tracking.PixelPath, func(c *gin.Context) {
-		tok, err := tracker.Verify(c.Query("t"))
-		if err == nil {
-			_ = emailLogRepo.UpdateStatus(c.Request.Context(), tok.LogID, repository.StatusOpened)
-			_ = statsRepo.IncrementStat(c.Request.Context(), tok.ClientID, time.Now().UTC(), "opened")
-		}
-		c.Data(http.StatusOK, "image/gif", transparentGIF)
-	})
+	// Open-tracking pixel: GET /o/:logID
+	r.GET("/o/:logID", trackHandlers.HandleOpen)
 
-	// Click-redirect.
-	r.GET(cfg.Tracking.ClickPath, func(c *gin.Context) {
-		tok, err := tracker.Verify(c.Query("t"))
-		if err != nil || tok.URL == "" {
-			c.Status(http.StatusBadRequest)
-			return
-		}
-		_ = emailLogRepo.UpdateStatus(c.Request.Context(), tok.LogID, repository.StatusClicked)
-		_ = statsRepo.IncrementStat(c.Request.Context(), tok.ClientID, time.Now().UTC(), "clicked")
-		c.Redirect(http.StatusFound, tok.URL)
-	})
+	// Click-redirect: GET /c/:logID?u={encoded_url}
+	r.GET("/c/:logID", trackHandlers.HandleClick)
 
 	// ── Authenticated REST endpoints ──────────────────────────────────────────
 	api := r.Group("/api/v1", middleware.APIKeyMiddleware(authenticator))
@@ -305,15 +284,6 @@ func main() {
 		logger.Error("shutdown error", "error", err)
 	}
 	logger.Info("API server stopped")
-}
-
-// transparentGIF is a 1×1 GIF returned by the open-tracking pixel endpoint.
-var transparentGIF = []byte{
-	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
-	0x80, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21,
-	0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
-	0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44,
-	0x01, 0x00, 0x3b,
 }
 
 func newLogger(level string) *slog.Logger {
